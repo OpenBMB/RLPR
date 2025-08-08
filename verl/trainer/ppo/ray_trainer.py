@@ -2523,7 +2523,7 @@ class RayPPOTrainer(object):
         }
 
         for i in range(batch_size):
-            if not valid_flags[i] or batch_input_ids[i].shape[0] > max_length:
+            if not valid_flags[i] or torch.sum(batch_input_ids[i] != self.tokenizer.pad_token_id).item() > max_length:
                 valid_flags[i] = False
 
             pos_startanswer = pos_startanswer_batch[i]
