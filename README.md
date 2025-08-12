@@ -128,6 +128,11 @@ bash examples/RLPR/reproduce_qwen.sh
 # bash examples/RLPR/reproduce_gemma.sh
 ```
 
+
+### Resuming Training
+
+If you need to continue training from a specific training step, navigate to the checkpoint save directory (default is `data/checkpoints/`), modify the value in the `latest_checkpointed_iteration.txt` file to the target step, and then rerun the training script.
+
 ## Evaluation
 
 1. Follow the steps 1~4 in the [Train](#train) section to prepare the data, model and judge model (optional).

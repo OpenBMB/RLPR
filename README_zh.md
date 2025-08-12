@@ -124,6 +124,10 @@
     # bash examples/RLPR/reproduce_gemma.sh
     ```
 
+### 恢复训练
+
+如果您需要从某个训练步骤（Step）继续训练，请进入checkpoint保存目录（默认为`data/checkpoints/`）,修改`latest_checkpointed_iteration.txt`文件中的数值为目标Step，然后重新运行训练程序即可
+
 ## 评估
 
 1.  遵循[训练](#训练)部分中的步骤 1~4 准备数据、模型和评估模型（可选）。

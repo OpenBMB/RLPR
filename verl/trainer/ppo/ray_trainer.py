@@ -1304,6 +1304,11 @@ class RayPPOTrainer(object):
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
 
+        if hasattr(self, 'ema_mean'):
+            ema_mean_json_path = os.path.join(self.config.trainer.default_local_dir, 'ema_mean.json')
+            save_to_json(self.ema_mean_json, ema_mean_json_path)
+
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable' or self.config.trainer.get('val_only', False) is True:
             return 0
@@ -1366,6 +1371,13 @@ class RayPPOTrainer(object):
         self.train_dataloader = torch.load(dataloader_local_path, weights_only=False)
         if isinstance(self.train_dataloader.dataset, RLHFDataset):
             self.train_dataloader.dataset.resume_dataset_state()
+
+        ema_mean_json_path = os.path.join(self.config.trainer.default_local_dir, 'ema_mean.json')
+        if os.path.exists(ema_mean_json_path):
+            self.ema_mean_json = load_from_json(ema_mean_json_path)
+            self.ema_mean = self.ema_mean_json[str(self.global_steps)]
+
+
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1561,9 +1573,9 @@ class RayPPOTrainer(object):
 
                     if self.config.data.get('filter_mode', 'default') == 'EMA':
                         if self.global_steps == 1 or (self.config.data.get('resume_ema_mean', None) is not None):
-                            ema_mean = self.config.data.get('resume_ema_mean', None)
-                            if ema_mean is not None:
-                                print(f"We resume the ema_mean as {ema_mean=}")
+                            self.ema_mean = self.config.data.get('resume_ema_mean', None)
+                            if self.ema_mean is not None:
+                                print(f"We resume the ema_mean as {self.ema_mean=}")
                         if self.global_steps >= self.config.data.filter_ema_start_step:
                             if self.global_steps >= self.config.data.filter_start_step:
                                 print(f"We are calculating the score_std_list using EMA: {self.global_steps=} {len(score_std_list)=} {score_std_list=}")
@@ -1576,17 +1588,21 @@ class RayPPOTrainer(object):
                                 if self.config.data.get('resume_ema_mean', None):
                                     self.config.data.resume_ema_mean = None
                                 else:
-                                    if ema_mean is None:
-                                        ema_mean = sum(score_std_list) / len(score_std_list) # init the ema
+                                    if self.ema_mean is None:
+                                        self.ema_mean = sum(score_std_list) / len(score_std_list) # init the ema
+                                        self.ema_mean_json = {}
+                                    elif len(score_std_list) == 0: # THe self.ema_mean is loaded from the saved txt file
+                                        pass
                                     else:
                                         new_value = score_std_list[-1]
                                         if not (math.isnan(new_value) or math.isinf(new_value)):
-                                            ema_mean = score_std_list[-1] * (1 - self.config.data.filter_ema_ratio) + ema_mean * self.config.data.filter_ema_ratio
+                                            self.ema_mean = score_std_list[-1] * (1 - self.config.data.filter_ema_ratio) + self.ema_mean * self.config.data.filter_ema_ratio
                                         else:
                                             print('Encounter NaN or Inf std!', flush=True)
-                                print(f"{ema_mean=} for {self.global_steps=}")
-                                
-                                self.config.data.accuracy_lower_bound = ema_mean * self.config.data.std_filter_beta
+                                print(f"{self.ema_mean=} for {self.global_steps=}")
+                                self.ema_mean_json[self.global_steps] = self.ema_mean
+
+                                self.config.data.accuracy_lower_bound = self.ema_mean * self.config.data.std_filter_beta
                             score_std_list.append([])
 
 
@@ -2507,7 +2523,7 @@ class RayPPOTrainer(object):
         }
 
         for i in range(batch_size):
-            if not valid_flags[i] or batch_input_ids[i].shape[0] > max_length:
+            if not valid_flags[i] or torch.sum(batch_input_ids[i] != self.tokenizer.pad_token_id).item() > max_length:
                 valid_flags[i] = False
 
             pos_startanswer = pos_startanswer_batch[i]
@@ -2958,49 +2974,50 @@ class RayPPOTrainer(object):
         if self.config.data.shuffle:
             self.train_dataloader.sampler.generator.manual_seed(current_seed)
 
+        save_path = os.path.join(self.config.trainer.default_local_dir, 'promptgt2scoreA.json')
+
         promptgt2scoreA = {}
+        if os.path.exists(save_path):
+            promptgt2scoreA = load_from_json(save_path)
+        else:
+            scoreA_list = []
 
-        scoreA_list = []
+            total_train_samples = len(self.train_dataloader.dataset)
+
+            train_dataloader = self.train_dataloader_repeat
+
+            for idx, batch_dict in tqdm(enumerate(train_dataloader), total=len(self.train_dataloader) + 4):
+                print(f"{idx=} {len(promptgt2scoreA)=} {len(scoreA_list)=}. The goal is {total_train_samples}")
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                scoreAs, prompt_strs, ground_truths, old_log_probs_in_gt_list = self.get_scoreA(batch)
+                # Process each item in the batch
+
+                for i in range(len(batch)):
+                    prompt = replace_left_and_right_str(self.tokenizer.decode(
+                        batch.batch[i]['input_ids'], 
+                        skip_special_tokens=False
+                    ), self.tokenizer.pad_token)
+                    ground_truth = batch[i].non_tensor_batch['reward_model']['ground_truth']
+                    key = prompt + '\n\n\n' + ground_truth
+                    if key not in promptgt2scoreA:
+                        promptgt2scoreA[key] = scoreAs[i]
+                        scoreA_list.append(scoreAs[i])
+                if idx >= len(self.train_dataloader) + 4:
+                    break
+
+            if 'wandb' in self.config.trainer.logger:
+                # Log the scoreA distribution to WandB
+                self._maybe_log_histogram_to_wandb(
+                    scoreA_list, 
+                    'figures/scoreA', 
+                    'scoreA', 
+                    'Score A Distribution'
+                )
+
+            save_to_json(promptgt2scoreA, save_path)
 
 
-        total_train_samples = len(self.train_dataloader.dataset)
-
-        train_dataloader = self.train_dataloader_repeat
-
-        for idx, batch_dict in tqdm(enumerate(train_dataloader), total=len(self.train_dataloader) + 4):
-            print(f"{idx=} {len(promptgt2scoreA)=} {len(scoreA_list)=}. The goal is {total_train_samples}")
-            batch: DataProto = DataProto.from_single_dict(batch_dict)
-
-            scoreAs, prompt_strs, ground_truths, old_log_probs_in_gt_list = self.get_scoreA(batch)
-            # Process each item in the batch
-
-            for i in range(len(batch)):
-                prompt = replace_left_and_right_str(self.tokenizer.decode(
-                    batch.batch[i]['input_ids'], 
-                    skip_special_tokens=False
-                ), self.tokenizer.pad_token)
-                ground_truth = batch[i].non_tensor_batch['reward_model']['ground_truth']
-                key = prompt + '\n\n\n' + ground_truth
-                if key not in promptgt2scoreA:
-                    promptgt2scoreA[key] = scoreAs[i]
-                    scoreA_list.append(scoreAs[i])
-            if idx >= len(self.train_dataloader) + 4:
-                break
-
-        save_path = 'data/logs/promptgt2scoreA.json'
-        with open(save_path, 'w') as file:
-            print(f"We dump to {save_path}")
-            json.dump(promptgt2scoreA, file)
-            # assert False
-
-        if 'wandb' in self.config.trainer.logger:
-            # Log the scoreA distribution to WandB
-            self._maybe_log_histogram_to_wandb(
-                scoreA_list, 
-                'figures/scoreA', 
-                'scoreA', 
-                'Score A Distribution'
-            )
 
         # Reset the seed to ensure consistent data order for training
         if self.config.data.shuffle:
@@ -3197,3 +3214,14 @@ def replace_left_and_right_str(text, left_str):
     while text.endswith(left_str):
         text = text[:-len(left_str)]
     return text
+
+def load_from_json(path):
+    with open(path, 'r') as file:
+        print(f"Loading from {path}")
+        result = json.load(file)
+    return result
+
+def save_to_json(result, path):
+    with open(path, 'w') as file:
+        print(f"We dump to {path}")
+        json.dump(result, file)
